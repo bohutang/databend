@@ -152,6 +152,8 @@ Exchange
     ├── push downs: [filters: [], limit: NONE]
     └── estimated rows: 6.00
 
+# Re-reads of `article` may hit the in-memory data cache of whichever node scans each block,
+# so the remote/memory split is not deterministic.
 query T
 EXPLAIN ANALYZE SELECT * FROM article where article_id < 3;
 ----
@@ -164,7 +166,7 @@ Exchange
     ├── output rows: 4
     ├── output bytes: 80.00 B
     ├── bytes scanned: 80.00 B
-    ├── read from remote: 448.00 B
+    ├── read from <slt:ignore>
     ├── runtime filter bloom time: <slt:ignore>
     ├── runtime filter inlist/min-max time: <slt:ignore>
     ├── table: default.default.article
@@ -228,7 +230,7 @@ Exchange
         ├── output rows: 1
         ├── output bytes: 20.00 B
         ├── bytes scanned: 20.00 B
-        ├── read from remote: 112.00 B
+        ├── read from <slt:ignore>
         ├── parts pruned by runtime filter: 5
         ├── runtime filter bloom time: <slt:ignore>
         ├── runtime filter inlist/min-max time: <slt:ignore>
