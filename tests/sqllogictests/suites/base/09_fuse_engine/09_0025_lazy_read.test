@@ -235,3 +235,26 @@ select count(*) from (
 
 statement ok
 drop table t_prewhere_row_id
+
+# Sparse RowFetch must return TopN order, not storage order, across Parquet pages.
+statement ok
+create or replace table t_sparse_row_fetch (k int, v int null, s string)
+storage_format = 'parquet' data_page_rows = 64 row_per_block = 4096
+
+statement ok
+settings (max_threads = 1, max_block_size = 4096)
+insert into t_sparse_row_fetch
+select case number when 2048 then 0 when 17 then 1 when 4095 then 2 when 3000 then 3 else 4 end,
+       if(number = 4095, null, number), concat('row', to_string(number))
+from numbers(4096)
+
+query IT
+select v, s from t_sparse_row_fetch order by k limit 4
+----
+2048 row2048
+17 row17
+NULL row4095
+3000 row3000
+
+statement ok
+drop table t_sparse_row_fetch

@@ -27,6 +27,8 @@ use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::MutableBitmap;
 use databend_common_storage::ColumnNodes;
 use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheValue;
@@ -51,6 +53,7 @@ use crate::FuseTable;
 use crate::PartColumnGroup;
 use crate::io::BlockReader;
 use crate::io::FuseCaches;
+use crate::io::RowSelection;
 use crate::io::SegmentCache;
 use crate::io::SegmentInfoReader;
 use crate::io::cache::BlockMetas;
@@ -330,7 +333,7 @@ impl ParquetRowsFetcher {
 
                 Ok((
                     final_index,
-                    Self::build_block(&reader, &metadata, chunk)?.take(take_indices.as_slice())?,
+                    Self::decode_rows(&reader, &metadata, chunk, take_indices)?,
                 ))
             }
         }
@@ -373,20 +376,61 @@ impl ParquetRowsFetcher {
         })
     }
 
-    fn build_block(
+    fn decode_rows(
         reader: &BlockReader,
         metadata: &RowsFetchMetadataImpl,
         chunk: BlockReadResult,
+        mut take_indices: Vec<u32>,
     ) -> Result<DataBlock> {
-        let columns_chunks = chunk.columns_chunks()?;
-        reader.deserialize_parquet_files(
-            metadata.nums_rows,
-            &metadata.data_files(),
-            columns_chunks,
-            None,
-            None,
-        )
+        let column_chunks = chunk.columns_chunks()?;
+        // Dense fetches are cheaper to decode in bulk. Sparse decoding also cannot
+        // populate the column array cache, which stores whole columns.
+        const MAX_SPARSE_ROWS: usize = 1024;
+        const SPARSE_DENSITY_DIVISOR: usize = 16;
+        let sparse_limit = (metadata.nums_rows / SPARSE_DENSITY_DIVISOR).min(MAX_SPARSE_ROWS);
+        let fill_cache =
+            reader.policy.memory.writes() && FuseCaches::instance().column_arrays.is_enabled();
+        let selection =
+            if !fill_cache && !column_chunks.is_empty() && take_indices.len() <= sparse_limit {
+                Some(select_rows(metadata.nums_rows, &mut take_indices)?)
+            } else {
+                None
+            };
+        reader
+            .deserialize_parquet_files(
+                metadata.nums_rows,
+                &metadata.data_files(),
+                column_chunks,
+                selection.as_ref(),
+                None,
+            )?
+            .take(take_indices.as_slice())
     }
+}
+
+/// Parquet emits unique selected rows in storage order. Rewrite `offsets` to
+/// gather them in the caller's order, including any duplicate row IDs.
+fn select_rows(num_rows: usize, offsets: &mut [u32]) -> Result<RowSelection> {
+    let mut sorted = offsets.iter().copied().enumerate().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|&(_, offset)| offset);
+    let mut bitmap = MutableBitmap::from_len_zeroed(num_rows);
+    let mut previous = None;
+    let mut selected = 0;
+    for (original, offset) in sorted {
+        let row = offset as usize;
+        if row >= num_rows {
+            return Err(ErrorCode::Internal(format!(
+                "RowID offset {row} is out of bounds for a block of {num_rows} rows"
+            )));
+        }
+        if previous != Some(offset) {
+            bitmap.set(row, true);
+            selected += 1;
+            previous = Some(offset);
+        }
+        offsets[original] = selected - 1;
+    }
+    Ok(RowSelection::from(&Bitmap::from(bitmap)))
 }
 
 /// Segments whose decoded block metas a fetcher keeps.
@@ -451,6 +495,23 @@ mod tests {
                 let _ = sender.send(());
             }
         }
+    }
+
+    #[test]
+    fn sparse_row_selection_preserves_order_and_duplicates() -> Result<()> {
+        let mut offsets = [127, 0, 65, 127, 3, 0];
+        let selection = select_rows(128, &mut offsets)?;
+        let rows = selection
+            .bitmap
+            .iter()
+            .enumerate()
+            .filter_map(|(row, selected)| selected.then_some(row))
+            .collect::<Vec<_>>();
+        assert_eq!(selection.selected_rows, 4);
+        assert_eq!(rows, [0, 3, 65, 127]);
+        assert_eq!(offsets, [3, 0, 2, 3, 1, 0]);
+        assert!(select_rows(128, &mut [128]).is_err());
+        Ok(())
     }
 
     #[tokio::test]
