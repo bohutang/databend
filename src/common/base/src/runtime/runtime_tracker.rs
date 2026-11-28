@@ -519,6 +519,13 @@ impl ThreadTracker {
         })
     }
 
+    /// Finish accounting on a thread that will be reused instead of exiting.
+    pub fn flush_worker_memory() {
+        let _guard = LimitMemGuard::enter_unlimited();
+        MemStatBuffer::current().flush_and_detach();
+        let _ = GlobalStatBuffer::current().flush::<false>(0);
+    }
+
     pub fn new_tracking_payload() -> TrackingPayload {
         TRACKER.with(|x| x.borrow().payload.as_ref().clone())
     }

@@ -182,6 +182,14 @@ impl MemStatBuffer {
         // due to other threads sharing the same MemStat may have allocated a lot of memory.
     }
 
+    /// Publish pending accounting and release the cached owner, even when allocations
+    /// and frees cancelled out. Unlike `mark_destroyed`, the buffer remains reusable.
+    pub(crate) fn flush_and_detach(&mut self) {
+        let _ = self.flush::<false>(0);
+        self.cur_mem_stat_id = 0;
+        self.cur_mem_stat = None;
+    }
+
     pub fn mark_destroyed(&mut self) {
         let _guard = LimitMemGuard::enter_unlimited();
 
