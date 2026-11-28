@@ -18,15 +18,15 @@ databend_common_tracing::register_module_tag!("[PIPELINE-EXECUTOR]");
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
+use databend_common_base::base::GlobalInstance;
 use databend_common_base::runtime::ExecutorStatsSnapshot;
 use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_base::runtime::LimitMemGuard;
 use databend_common_base::runtime::PerfEvent;
 use databend_common_base::runtime::Runtime;
-use databend_common_base::runtime::Thread;
-use databend_common_base::runtime::ThreadJoinHandle;
 use databend_common_base::runtime::ThreadTracker;
 use databend_common_base::runtime::catch_unwind;
 use databend_common_base::runtime::error_info::NodeErrorType;
@@ -50,6 +50,7 @@ use petgraph::matrix_graph::Zero;
 use crate::pipelines::executor::ExecutorSettings;
 use crate::pipelines::executor::ExecutorWorkerContext;
 use crate::pipelines::executor::QueryExecutorTasksQueue;
+use crate::pipelines::executor::QueryWorkerPool;
 use crate::pipelines::executor::RunningGraph;
 use crate::pipelines::executor::WatchNotify;
 use crate::pipelines::executor::WorkersCondvar;
@@ -301,30 +302,25 @@ impl QueryPipelineExecutor {
 
         self.start_executor_daemon()?;
 
-        let mut thread_join_handles = self.execute_threads(self.threads_num);
-
-        while let Some(join_handle) = thread_join_handles.pop() {
-            let thread_res = join_handle.join().flatten();
-
-            {
-                let finished_error_guard = self.finished_error.lock();
-                if let Some(error) = finished_error_guard.as_ref() {
-                    let may_error = error.clone();
-                    drop(finished_error_guard);
-
-                    let profiling = self.fetch_plans_profile(true);
-                    self.on_finished(ExecutionInfo::create(Err(may_error.clone()), profiling))?;
-                    return Err(may_error);
-                }
+        for worker in self.execute_threads(self.threads_num).into_iter().rev() {
+            let result = worker.recv().unwrap_or_else(|_| {
+                Err(ErrorCode::Internal(
+                    "Pipeline worker exited without a result",
+                ))
+            });
+            if let Err(error) = result {
+                self.finish(Some(error));
             }
-
-            // We will ignore the abort query error, because returned by finished_error if abort query.
-            if matches!(&thread_res, Err(error) if error.code() != ErrorCode::ABORTED_QUERY) {
-                let may_error = thread_res.unwrap_err();
-                let profiling = self.fetch_plans_profile(true);
-                self.on_finished(ExecutionInfo::create(Err(may_error.clone()), profiling))?;
-                return Err(may_error);
+            if self.finished_error.lock().is_some() {
+                break;
             }
+        }
+
+        let error = self.finished_error.lock().clone();
+        if let Some(error) = error {
+            let profiling = self.fetch_plans_profile(true);
+            self.on_finished(ExecutionInfo::create(Err(error.clone()), profiling))?;
+            return Err(error);
         }
 
         if let Err(error) = self.graph.assert_finished_graph() {
@@ -411,8 +407,9 @@ impl QueryPipelineExecutor {
         Ok(())
     }
 
-    fn execute_threads(self: &Arc<Self>, threads: usize) -> Vec<ThreadJoinHandle<Result<()>>> {
-        let mut thread_join_handles = Vec::with_capacity(threads);
+    fn execute_threads(self: &Arc<Self>, threads: usize) -> Vec<Receiver<Result<()>>> {
+        let pool = GlobalInstance::get::<Arc<QueryWorkerPool>>();
+        let mut workers = Vec::with_capacity(threads);
         info!(num = threads; "starting worker threads");
 
         for thread_num in 0..threads {
@@ -432,7 +429,7 @@ impl QueryPipelineExecutor {
 
             let span = Span::enter_with_local_parent("QueryPipelineExecutor::execute_threads")
                 .with_property(|| ("thread_name", name.clone()));
-            thread_join_handles.push(Thread::named_spawn(Some(name), move || unsafe {
+            let worker = pool.spawn(name, move || unsafe {
                 let _g = span.set_local_parent();
                 let this_clone = this.clone();
                 let try_result = catch_unwind(|| this_clone.execute_single_thread(thread_num));
@@ -450,9 +447,16 @@ impl QueryPipelineExecutor {
                 }
 
                 Ok(())
-            }));
+            });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    self.finish(Some(error));
+                    break;
+                }
+            }
         }
-        thread_join_handles
+        workers
     }
 
     /// # Safety

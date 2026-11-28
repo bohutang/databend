@@ -1,0 +1,215 @@
+// Copyright 2021 Datafuse Labs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+
+use databend_common_base::runtime::ThreadTracker;
+use databend_common_base::runtime::catch_unwind;
+use databend_common_base::runtime::take_alloc_error_panic;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use parking_lot::Condvar;
+use parking_lot::Mutex;
+
+type Job = Box<dyn FnOnce() + Send>;
+
+struct IdleWorkers {
+    waiting: usize,
+    jobs: VecDeque<Job>,
+}
+
+/// Reuse threads, not execution slots. Each submitted loop gets a worker even if every
+/// existing worker is blocked waiting for its query's processors.
+pub(crate) struct QueryWorkerPool {
+    idle: Mutex<IdleWorkers>,
+    wake: Condvar,
+    max_idle: usize,
+    idle_timeout: Duration,
+}
+
+impl QueryWorkerPool {
+    pub(crate) fn new(max_idle: usize, idle_timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            idle: Mutex::new(IdleWorkers {
+                waiting: 0,
+                jobs: VecDeque::with_capacity(max_idle),
+            }),
+            wake: Condvar::new(),
+            max_idle,
+            idle_timeout,
+        })
+    }
+
+    pub(super) fn spawn<T: Send + 'static>(
+        self: &Arc<Self>,
+        name: String,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<mpsc::Receiver<Result<T>>> {
+        let tracked = ThreadTracker::tracking_function(f);
+        let (tx, rx) = mpsc::channel();
+        let job: Job = Box::new(move || {
+            let result = catch_unwind(tracked).flatten();
+            // These allocator diagnostics are thread-local, outside TrackingPayload.
+            ThreadTracker::replace_error_message(None);
+            take_alloc_error_panic();
+            let _ = tx.send(result);
+        });
+
+        {
+            let mut idle = self.idle.lock();
+            if idle.waiting > idle.jobs.len() {
+                idle.jobs.push_back(job);
+                self.wake.notify_one();
+                return Ok(rx);
+            }
+        }
+
+        let pool = self.clone();
+        let mut builder = thread::Builder::new().name(name);
+        if cfg!(debug_assertions) {
+            builder = builder.stack_size(5 * 1024 * 1024);
+        }
+        // Thread::named_spawn inherits the submitter's tracking payload for the entire
+        // thread lifetime. Here only `tracked` may inherit it; idle workers must not.
+        builder
+            .spawn(move || {
+                ThreadTracker::init();
+                job();
+                while let Some(job) = pool.next_job() {
+                    job();
+                }
+            })
+            .map_err(|err| ErrorCode::Internal(format!("Cannot start pipeline worker: {err}")))?;
+        Ok(rx)
+    }
+
+    fn next_job(&self) -> Option<Job> {
+        let mut idle = self.idle.lock();
+        if idle.waiting == self.max_idle {
+            return None;
+        }
+        idle.waiting += 1;
+        let deadline = Instant::now() + self.idle_timeout;
+        // Claim a reserved job *before* retiring, under the same lock that reserves it.
+        while idle.jobs.is_empty() && !self.wake.wait_until(&mut idle, deadline).timed_out() {}
+        idle.waiting -= 1;
+        idle.jobs.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::thread::ThreadId;
+
+    use databend_common_base::runtime::MemStat;
+
+    use super::*;
+
+    fn wait_for_idle(pool: &QueryWorkerPool, waiting: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.idle.lock().waiting != waiting {
+            assert!(Instant::now() < deadline, "expected {waiting} idle workers");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn failed_query_does_not_follow_a_reused_thread() -> Result<()> {
+        let pool = QueryWorkerPool::new(1, Duration::from_secs(30));
+        let (thread_id, first_id) = mpsc::channel();
+        let first_mem = MemStat::create("query-a".into());
+        let interrupt = Arc::new(AtomicBool::new(true));
+        let weak = Arc::downgrade(&interrupt);
+        {
+            let mut payload = ThreadTracker::new_tracking_payload();
+            payload.query_id = Some("a".into());
+            payload.processor_interrupt = Some(interrupt);
+            payload.mem_stat = Some(first_mem.clone());
+            let _guard = ThreadTracker::tracking(payload);
+            let result = pool.spawn("pool-test".into(), move || -> Result<()> {
+                assert!(Arc::ptr_eq(ThreadTracker::mem_stat().unwrap(), &first_mem));
+                assert_eq!(ThreadTracker::query_id().unwrap(), "a");
+                assert!(ThreadTracker::is_interrupted());
+                ThreadTracker::replace_error_message(Some("a's allocation error".into()));
+                thread_id.send(thread::current().id()).unwrap();
+                Err(ErrorCode::AbortedQuery("cancel a"))
+            })?;
+            assert_eq!(
+                result.recv().unwrap().unwrap_err().code(),
+                ErrorCode::ABORTED_QUERY
+            );
+        }
+        wait_for_idle(&pool, 1);
+        assert!(weak.upgrade().is_none(), "idle thread retained query A");
+        let mut payload = ThreadTracker::new_tracking_payload();
+        let second_mem = MemStat::create("query-b".into());
+        payload.query_id = Some("b".into());
+        payload.mem_stat = Some(second_mem.clone());
+        let _guard = ThreadTracker::tracking(payload);
+        let second_id = pool.spawn("pool-test".into(), move || {
+            assert_eq!(ThreadTracker::query_id().unwrap(), "b");
+            assert!(Arc::ptr_eq(ThreadTracker::mem_stat().unwrap(), &second_mem));
+            assert!(!ThreadTracker::is_interrupted());
+            assert!(ThreadTracker::replace_error_message(None).is_none());
+            Ok(thread::current().id())
+        })?;
+        assert_eq!(first_id.recv().unwrap(), second_id.recv().unwrap()?);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_limit_does_not_queue_running_workers_and_idle_workers_retire() -> Result<()> {
+        let pool = QueryWorkerPool::new(1, Duration::from_millis(100));
+        let (release, blocked) = mpsc::channel();
+        let a = pool.spawn("a".into(), move || {
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(thread::current().id())
+        })?;
+        let id = || -> Result<ThreadId> { Ok(thread::current().id()) };
+        let b = pool.spawn("b".into(), id)?.recv().unwrap()?;
+        release.send(()).unwrap();
+        let a = a.recv().unwrap()?;
+        assert_ne!(a, b);
+        // The worker loops hold a strong pool reference until they actually exit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&pool) > 1 {
+            assert!(Instant::now() < deadline, "worker failed to retire");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let c = pool.spawn("c".into(), id)?.recv().unwrap()?;
+        assert!(c != a && c != b);
+        Ok(())
+    }
+
+    #[test]
+    fn submissions_racing_idle_expiry_complete() -> Result<()> {
+        let pool = QueryWorkerPool::new(2, Duration::from_micros(100));
+        for _ in 0..64 {
+            let results = (0..8)
+                .map(|n| pool.spawn("race".into(), move || Ok(n)))
+                .collect::<Result<Vec<_>>>()?;
+            for (n, result) in results.into_iter().enumerate() {
+                assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap()?, n);
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
+        Ok(())
+    }
+}

@@ -58,6 +58,7 @@ use crate::history_tables::GlobalHistoryLog;
 use crate::interpreters::TableHookScheduler;
 use crate::locks::CoordinationManager;
 use crate::pipelines::executor::GlobalQueriesExecutor;
+use crate::pipelines::executor::QueryWorkerPool;
 use crate::servers::flight::v1::exchange::DataExchangeManager;
 use crate::servers::http::v1::ClientSessionManager;
 use crate::servers::http::v1::HttpQueryManager;
@@ -232,6 +233,11 @@ impl GlobalServices {
             DummyResourcesManagement::init()?;
         }
 
+        // Bound only the idle reserve, not the width or number of concurrent queries.
+        GlobalInstance::set(QueryWorkerPool::new(
+            num_cpus::get() * 4,
+            std::time::Duration::from_secs(10),
+        ));
         if config.query.common.enable_queries_executor {
             GlobalQueriesExecutor::init()?;
         }

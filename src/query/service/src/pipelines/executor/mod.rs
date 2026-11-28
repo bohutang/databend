@@ -27,6 +27,7 @@ mod processor_async_task;
 mod queries_executor_tasks;
 mod queries_pipeline_executor;
 mod query_executor_tasks;
+mod query_worker_pool;
 
 pub use databend_common_base::base::WatchNotify;
 pub use executor_condvar::WorkersCondvar;
@@ -46,3 +47,4 @@ pub use queries_executor_tasks::QueriesExecutorTasksQueue;
 pub use queries_pipeline_executor::QueriesPipelineExecutor;
 pub use query_executor_tasks::QueryExecutorTasksQueue;
 pub use query_pipeline_executor::QueryPipelineExecutor;
+pub(crate) use query_worker_pool::QueryWorkerPool;
