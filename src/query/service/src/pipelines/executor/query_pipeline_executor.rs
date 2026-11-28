@@ -414,7 +414,7 @@ impl QueryPipelineExecutor {
         for thread_num in 0..threads {
             let this = self.clone();
             let span = Span::enter_with_local_parent("QueryPipelineExecutor::execute_threads");
-            let worker = pool.spawn(thread_num, move || unsafe {
+            let worker = pool.spawn(move || unsafe {
                 span.add_properties(|| {
                     let thread = std::thread::current();
                     [
