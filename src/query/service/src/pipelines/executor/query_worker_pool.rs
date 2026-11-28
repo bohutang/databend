@@ -12,27 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 use databend_common_base::runtime::ThreadTracker;
 use databend_common_base::runtime::catch_unwind;
 use databend_common_base::runtime::take_alloc_error_panic;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use parking_lot::Condvar;
 use parking_lot::Mutex;
 
 type Job = Box<dyn FnOnce() + Send>;
 
 struct IdleWorkers {
     closed: bool,
-    waiting: usize,
-    jobs: VecDeque<Job>,
+    // Oldest first. Each sender belongs to one parked thread.
+    workers: Vec<(thread::ThreadId, mpsc::SyncSender<Option<Job>>)>,
 }
 
 /// Reuse threads, not execution slots. Each submitted loop gets a worker even if every
@@ -44,7 +41,6 @@ pub(crate) struct QueryWorkerPool {
 // Workers own this state, not the pool handle registered with GlobalInstance.
 struct WorkerState {
     idle: Mutex<IdleWorkers>,
-    wake: Condvar,
     max_idle: usize,
     idle_timeout: Duration,
 }
@@ -55,10 +51,8 @@ impl QueryWorkerPool {
             shared: Arc::new(WorkerState {
                 idle: Mutex::new(IdleWorkers {
                     closed: false,
-                    waiting: 0,
-                    jobs: VecDeque::with_capacity(max_idle),
+                    workers: Vec::with_capacity(max_idle),
                 }),
-                wake: Condvar::new(),
                 max_idle,
                 idle_timeout,
             }),
@@ -83,9 +77,11 @@ impl QueryWorkerPool {
 
         {
             let mut idle = self.shared.idle.lock();
-            if idle.waiting > idle.jobs.len() {
-                idle.jobs.push_back(job);
-                self.shared.wake.notify_one();
+            if let Some((_, worker)) = idle.workers.pop() {
+                // The parked worker cannot retire until it acquires this same lock.
+                worker
+                    .try_send(Some(job))
+                    .map_err(|_| ErrorCode::Internal("Idle pipeline worker unavailable"))?;
                 return Ok(rx);
             }
         }
@@ -100,8 +96,9 @@ impl QueryWorkerPool {
         builder
             .spawn(move || {
                 ThreadTracker::init();
+                let (sender, inbox) = mpsc::sync_channel(1);
                 job();
-                while let Some(job) = shared.next_job() {
+                while let Some(job) = shared.next_job(&sender, &inbox) {
                     job();
                 }
             })
@@ -123,31 +120,46 @@ impl QueryWorkerPool {
 
 impl Drop for QueryWorkerPool {
     fn drop(&mut self) {
-        self.shared.idle.lock().closed = true;
-        self.shared.wake.notify_all();
+        let mut idle = self.shared.idle.lock();
+        idle.closed = true;
+        for (_, worker) in idle.workers.drain(..) {
+            let _ = worker.try_send(None);
+        }
     }
 }
 
 impl WorkerState {
-    fn next_job(&self) -> Option<Job> {
+    fn next_job(
+        &self,
+        sender: &mpsc::SyncSender<Option<Job>>,
+        inbox: &mpsc::Receiver<Option<Job>>,
+    ) -> Option<Job> {
         // Dropping the job box or an undeliverable result can free query-owned
         // memory after the pre-completion flush. Do not park with that owner.
         ThreadTracker::flush_worker_memory();
+        let id = thread::current().id();
+        {
+            let mut idle = self.idle.lock();
+            if idle.closed || idle.workers.len() == self.max_idle {
+                return None;
+            }
+            idle.workers.push((id, sender.clone()));
+        }
+
+        if let Ok(job) = inbox.recv_timeout(self.idle_timeout) {
+            return job;
+        }
+        // Timeout races with assignment and shutdown. Whoever removes this entry
+        // owns the decision. A dispatcher removes AND sends under the lock, so a
+        // claimed worker must consume that message rather than discard the job.
         let mut idle = self.idle.lock();
-        if idle.closed || idle.waiting == self.max_idle {
+        if let Some(index) = idle.workers.iter().position(|(worker, _)| *worker == id) {
+            idle.workers.remove(index);
             return None;
         }
-        idle.waiting += 1;
-        let deadline = Instant::now() + self.idle_timeout;
-        // Claim a reserved job *before* retiring, under the same lock that reserves it.
-        while idle.jobs.is_empty()
-            && !idle.closed
-            && !self.wake.wait_until(&mut idle, deadline).timed_out()
-        {}
-        // A wake for shutdown can race a wake for a reservation. Take the accepted
-        // job even if the pool has since closed; do not park again after running it.
-        idle.waiting -= 1;
-        idle.jobs.pop_front()
+        inbox
+            .try_recv()
+            .expect("claimed worker must have a message")
     }
 }
 
@@ -155,6 +167,7 @@ impl WorkerState {
 mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread::ThreadId;
+    use std::time::Instant;
 
     use databend_common_base::runtime::MemStat;
     use databend_common_base::runtime::MemStatBuffer;
@@ -163,7 +176,7 @@ mod tests {
 
     fn wait_for_idle(pool: &QueryWorkerPool, waiting: usize) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while pool.shared.idle.lock().waiting != waiting {
+        while pool.shared.idle.lock().workers.len() != waiting {
             assert!(Instant::now() < deadline, "expected {waiting} idle workers");
             thread::sleep(Duration::from_millis(1));
         }
@@ -338,6 +351,44 @@ mod tests {
         let result = pool.spawn(0, || Ok(42))?;
         drop(pool);
         assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap()?, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn burst_workers_retire_while_serial_queries_continue() -> Result<()> {
+        const BURST: usize = 8;
+        let timeout = Duration::from_millis(500);
+        let pool = QueryWorkerPool::new(BURST, timeout);
+        // A weak TLS marker counts actual thread exits, not just workers momentarily
+        // absent from the idle list while executing a job.
+        thread_local! { static LIFETIME: Arc<()> = Arc::new(()); }
+        let mut burst = Vec::new();
+        for worker in 0..BURST {
+            let (release, blocked) = mpsc::channel();
+            let done = pool.spawn(worker, move || {
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(LIFETIME.with(Arc::downgrade))
+            })?;
+            burst.push((release, done));
+        }
+        let mut lifetimes = Vec::new();
+        for (release, done) in burst {
+            release.send(()).unwrap();
+            lifetimes.push(done.recv_timeout(Duration::from_secs(5)).unwrap()?);
+        }
+        wait_for_idle(&pool, BURST);
+
+        let deadline = Instant::now() + timeout * 4;
+        while lifetimes.iter().filter(|w| w.strong_count() != 0).count() > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "surplus threads kept alive by serial queries"
+            );
+            pool.spawn(0, || Ok(()))?
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()?;
+            thread::sleep(timeout / 32);
+        }
         Ok(())
     }
 
