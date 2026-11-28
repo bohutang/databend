@@ -410,26 +410,18 @@ impl QueryPipelineExecutor {
     fn execute_threads(self: &Arc<Self>, threads: usize) -> Vec<Receiver<Result<()>>> {
         let pool = GlobalInstance::get::<Arc<QueryWorkerPool>>();
         let mut workers = Vec::with_capacity(threads);
-        info!(num = threads; "starting worker threads");
 
         for thread_num in 0..threads {
             let this = self.clone();
-            #[allow(unused_mut)]
-            let mut name = format!("PipelineExecutor-{}", thread_num);
-
-            #[cfg(debug_assertions)]
-            {
-                // We need to pass the thread name in the unit test, because the thread name is the test name
-                if matches!(std::env::var("UNIT_TEST"), Ok(var_value) if var_value == "TRUE") {
-                    if let Some(cur_thread_name) = std::thread::current().name() {
-                        name = cur_thread_name.to_string();
-                    }
-                }
-            }
-
-            let span = Span::enter_with_local_parent("QueryPipelineExecutor::execute_threads")
-                .with_property(|| ("thread_name", name.clone()));
-            let worker = pool.spawn(name, move || unsafe {
+            let span = Span::enter_with_local_parent("QueryPipelineExecutor::execute_threads");
+            let worker = pool.spawn(thread_num, move || unsafe {
+                span.add_properties(|| {
+                    let thread = std::thread::current();
+                    [
+                        ("thread_name", thread.name().unwrap_or_default().to_owned()),
+                        ("worker_id", thread_num.to_string()),
+                    ]
+                });
                 let _g = span.set_local_parent();
                 let this_clone = this.clone();
                 let try_result = catch_unwind(|| this_clone.execute_single_thread(thread_num));

@@ -67,7 +67,7 @@ impl QueryWorkerPool {
 
     pub(super) fn spawn<T: Send + 'static>(
         &self,
-        name: String,
+        worker_id: usize,
         f: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<mpsc::Receiver<Result<T>>> {
         let tracked = ThreadTracker::tracking_function(f);
@@ -91,7 +91,7 @@ impl QueryWorkerPool {
         }
 
         let shared = self.shared.clone();
-        let mut builder = thread::Builder::new().name(name);
+        let mut builder = thread::Builder::new().name(Self::thread_name(worker_id));
         if cfg!(debug_assertions) {
             builder = builder.stack_size(5 * 1024 * 1024);
         }
@@ -107,6 +107,17 @@ impl QueryWorkerPool {
             })
             .map_err(|err| ErrorCode::Internal(format!("Cannot start pipeline worker: {err}")))?;
         Ok(rx)
+    }
+
+    fn thread_name(worker_id: usize) -> String {
+        // Test fixtures key their GlobalInstance registry by the parent thread's name.
+        #[cfg(debug_assertions)]
+        if matches!(std::env::var("UNIT_TEST").as_deref(), Ok("TRUE"))
+            && let Some(name) = thread::current().name()
+        {
+            return name.to_owned();
+        }
+        format!("PipelineExecutor-{worker_id}")
     }
 }
 
@@ -171,7 +182,7 @@ mod tests {
             payload.processor_interrupt = Some(interrupt);
             payload.mem_stat = Some(first_mem.clone());
             let _guard = ThreadTracker::tracking(payload);
-            let result = pool.spawn("pool-test".into(), move || -> Result<()> {
+            let result = pool.spawn(0, move || -> Result<()> {
                 assert!(Arc::ptr_eq(ThreadTracker::mem_stat().unwrap(), &first_mem));
                 assert_eq!(ThreadTracker::query_id().unwrap(), "a");
                 assert!(ThreadTracker::is_interrupted());
@@ -191,7 +202,7 @@ mod tests {
         payload.query_id = Some("b".into());
         payload.mem_stat = Some(second_mem.clone());
         let _guard = ThreadTracker::tracking(payload);
-        let second_id = pool.spawn("pool-test".into(), move || {
+        let second_id = pool.spawn(1, move || {
             assert_eq!(ThreadTracker::query_id().unwrap(), "b");
             assert!(Arc::ptr_eq(ThreadTracker::mem_stat().unwrap(), &second_mem));
             assert!(!ThreadTracker::is_interrupted());
@@ -206,12 +217,12 @@ mod tests {
     fn idle_limit_does_not_queue_running_workers_and_idle_workers_retire() -> Result<()> {
         let pool = QueryWorkerPool::new(1, Duration::from_millis(100));
         let (release, blocked) = mpsc::channel();
-        let a = pool.spawn("a".into(), move || {
+        let a = pool.spawn(0, move || {
             blocked.recv_timeout(Duration::from_secs(5)).unwrap();
             Ok(thread::current().id())
         })?;
         let id = || -> Result<ThreadId> { Ok(thread::current().id()) };
-        let b = pool.spawn("b".into(), id)?.recv().unwrap()?;
+        let b = pool.spawn(1, id)?.recv().unwrap()?;
         release.send(()).unwrap();
         let a = a.recv().unwrap()?;
         assert_ne!(a, b);
@@ -221,7 +232,7 @@ mod tests {
             assert!(Instant::now() < deadline, "worker failed to retire");
             thread::sleep(Duration::from_millis(1));
         }
-        let c = pool.spawn("c".into(), id)?.recv().unwrap()?;
+        let c = pool.spawn(2, id)?.recv().unwrap()?;
         assert!(c != a && c != b);
         Ok(())
     }
@@ -231,7 +242,7 @@ mod tests {
         let pool = QueryWorkerPool::new(1, Duration::from_secs(30));
         let stat = MemStat::create("allocation".into());
         let worker_stat = stat.clone();
-        let result = pool.spawn("accounting".into(), move || -> Result<()> {
+        let result = pool.spawn(0, move || -> Result<()> {
             MemStatBuffer::current().alloc(&worker_stat, 1024).unwrap();
             Err(ErrorCode::AbortedQuery("cancel after allocation"))
         })?;
@@ -250,7 +261,7 @@ mod tests {
         let pool = QueryWorkerPool::new(1, Duration::from_secs(30));
         let stat = MemStat::create("balanced".into());
         let worker_stat = stat.clone();
-        pool.spawn("accounting".into(), move || {
+        pool.spawn(0, move || {
             MemStatBuffer::current().alloc(&worker_stat, 1024).unwrap();
             MemStatBuffer::current().dealloc(&worker_stat, 1024);
             Ok(())
@@ -278,7 +289,7 @@ mod tests {
         let stat = MemStat::create("discarded result".into());
         let worker_stat = stat.clone();
         let (release, blocked) = mpsc::channel();
-        let result = pool.spawn("accounting".into(), move || {
+        let result = pool.spawn(0, move || {
             blocked.recv_timeout(Duration::from_secs(5)).unwrap();
             MemStatBuffer::current().alloc(&worker_stat, 1024).unwrap();
             Ok(ResultAllocation(worker_stat))
@@ -296,12 +307,12 @@ mod tests {
         thread_local! { static THREAD_LIFETIME: Arc<()> = Arc::new(()); }
         let pool = QueryWorkerPool::new(1, Duration::from_secs(30));
         let (release, blocked) = mpsc::channel();
-        let active = pool.spawn("active".into(), move || {
+        let active = pool.spawn(0, move || {
             blocked.recv_timeout(Duration::from_secs(5)).unwrap();
             Ok(42)
         })?;
         let idle_thread = pool
-            .spawn("idle".into(), || Ok(THREAD_LIFETIME.with(Arc::downgrade)))?
+            .spawn(1, || Ok(THREAD_LIFETIME.with(Arc::downgrade)))?
             .recv()
             .unwrap()?;
         wait_for_idle(&pool, 1);
@@ -322,9 +333,9 @@ mod tests {
     #[test]
     fn shutdown_preserves_jobs_already_assigned_to_idle_workers() -> Result<()> {
         let pool = QueryWorkerPool::new(1, Duration::from_secs(30));
-        pool.spawn("idle".into(), || Ok(()))?.recv().unwrap()?;
+        pool.spawn(0, || Ok(()))?.recv().unwrap()?;
         wait_for_idle(&pool, 1);
-        let result = pool.spawn("reserved".into(), || Ok(42))?;
+        let result = pool.spawn(0, || Ok(42))?;
         drop(pool);
         assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap()?, 42);
         Ok(())
@@ -335,7 +346,7 @@ mod tests {
         let pool = QueryWorkerPool::new(2, Duration::from_micros(100));
         for _ in 0..64 {
             let results = (0..8)
-                .map(|n| pool.spawn("race".into(), move || Ok(n)))
+                .map(|n| pool.spawn(n, move || Ok(n)))
                 .collect::<Result<Vec<_>>>()?;
             for (n, result) in results.into_iter().enumerate() {
                 assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap()?, n);
